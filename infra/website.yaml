@@ -110,6 +110,9 @@ Resources:
       LoadBalancerArn: !Ref LoadBalancer
       Port: 443
       Protocol: HTTPS
+      ListenerAttributes:
+        - Key: routing.http.response.x_frame_options.header_value
+          Value: "DENY"
 
       Certificates:
         - CertificateArn: !Ref Certificate
