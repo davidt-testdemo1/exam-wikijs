@@ -224,6 +224,90 @@ jobs:
             report_md.md
             report_json.json
           if-no-files-found: ignore
+      # The scan produces a report; this decides what it means. Kept separate from the ZAP step so
+      # that a scanner failing to publish can never be confused with an application failing a check
+      # -- which is exactly what happened when the action could not write its issue.
+      - name: Evaluate DAST findings
+        if: steps.dast_target.outputs.resolves == 'true'
+        run: |
+          python -m pip install --quiet "PyYAML==6.0.2"
+          python - <<'TUDOVU_DAST_GATE'
+          import json, os, sys, datetime
+          try:
+              import yaml
+          except ImportError:
+              print("::error::PyYAML is missing, so accepted findings cannot be read. Failing rather than ignoring the file.")
+              sys.exit(1)
+
+          REPORT = "report_json.json"
+          ACCEPTED = ".zap-accepted.yaml"
+          ORDER = ["informational", "low", "medium", "high"]
+          BY_CODE = {"0": "informational", "1": "low", "2": "medium", "3": "high"}
+          FLOOR = "medium"
+
+          # A missing report is not a clean scan. This step only runs after ZAP has run, so the file not
+          # being here means something went wrong that nobody has looked at -- reporting "no findings" would
+          # be the same absent-versus-broken confusion this pipeline keeps producing.
+          if not os.path.exists(REPORT):
+              print("::error::" + REPORT + " is missing, so the scan's result is unknown. Not treating that as a pass.")
+              sys.exit(1)
+
+          with open(REPORT) as fh:
+              raw = json.load(fh)
+
+          findings = {}
+          for site in raw.get("site") or []:
+              for alert in site.get("alerts") or []:
+                  pid = str(alert.get("pluginid", "")).strip()
+                  if not pid.replace("-", "").isdigit() or not pid:
+                      continue
+                  risk = BY_CODE.get(str(alert.get("riskcode", "")), "informational")
+                  inst = alert.get("instances") or []
+                  cur = findings.get(pid)
+                  if cur is None:
+                      findings[pid] = {"name": alert.get("alert") or pid, "risk": risk, "count": len(inst)}
+                  else:
+                      cur["count"] += len(inst)
+                      if ORDER.index(risk) > ORDER.index(cur["risk"]):
+                          cur["risk"] = risk
+
+          accepted, expired = {}, []
+          today = datetime.date.today().isoformat()
+          if os.path.exists(ACCEPTED):
+              doc = yaml.safe_load(open(ACCEPTED)) or {}
+              for entry in (doc.get("findings") or []):
+                  pid = str(entry.get("pluginId", "")).strip()
+                  exp = str(entry.get("expiresAt", ""))
+                  if not pid:
+                      continue
+                  if exp and exp >= today:
+                      accepted[pid] = entry
+                  else:
+                      expired.append((pid, exp, entry.get("reason", "")))
+
+          for pid, exp, reason in expired:
+              print("::warning::Acceptance for ZAP " + pid + " expired on " + exp + " (" + str(reason) + "). It blocks again from now on.")
+
+          blocking = [
+              (pid, f) for pid, f in findings.items()
+              if ORDER.index(f["risk"]) >= ORDER.index(FLOOR) and pid not in accepted
+          ]
+
+          print("DAST: " + str(len(findings)) + " finding(s), " + str(len(accepted)) + " accepted, " + str(len(blocking)) + " blocking (threshold: " + FLOOR + " and above).")
+          for pid, f in sorted(findings.items()):
+              state = "BLOCKING" if any(p == pid for p, _ in blocking) else ("accepted" if pid in accepted else "below threshold")
+              print("  [" + f["risk"].upper() + "] " + pid + " " + str(f["name"]) + " x" + str(f["count"]) + " - " + state)
+
+          if not blocking:
+              sys.exit(0)
+
+          print("::error::" + str(len(blocking)) + " DAST finding(s) are neither fixed nor accepted.")
+          print("::error::Tudovu can fix response-header findings on the load balancer without changing this")
+          print("::error::application, or record an expiring acceptance with a reason. Findings below the")
+          print("::error::threshold are reported and never block.")
+          sys.exit(1)
+
+          TUDOVU_DAST_GATE
       - name: DAST skipped (no target)
         if: false
         run: echo "Set the STAGING_URL repo variable to run the OWASP ZAP (DAST) gate against your staging URL."
