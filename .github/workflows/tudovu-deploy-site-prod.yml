@@ -1,0 +1,84 @@
+# .github/workflows/tudovu-deploy-site-prod.yml — dynamic web app deploy (gated on the secure pipeline)
+name: Tudovu Deploy Site / Prod
+on:
+  workflow_run:
+    workflows: ["Tudovu CI/CD App / Prod"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    # Auto: only after the secure pipeline passes. Manual: always (workflow_dispatch).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Same OIDC deploy role + region variables the Tudovu foundation
+          # stack provisions and sets on the repo.
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push image
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Per-app ECR repo named after the repository (lowercased for ECR).
+          REPO=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          aws ecr describe-repositories --repository-names "$REPO" --region us-east-1 >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO" --region us-east-1 --tags "Key=tudovu:repo,Value=$REPO_FULL" >/dev/null
+          IMAGE="$ECR_REGISTRY/$REPO:$GIT_SHA"
+          docker build --label "org.opencontainers.image.source=https://github.com/$REPO_FULL" -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Deploy infrastructure
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          ZONE_ID=$(aws route53 list-hosted-zones --output json | jq -r --arg d "wiki.demodeployments.com." '[.HostedZones[] | select(.Name as $n | $d | endswith($n))] | sort_by(.Name | length) | last | .Id // empty' | sed 's#/hostedzone/##')
+          if [ -z "$ZONE_ID" ]; then echo "No Route53 hosted zone found that owns wiki.demodeployments.com"; exit 1; fi
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text --region us-east-1)
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then echo "No default VPC in us-east-1 — create one, or set VpcId/PublicSubnetIds."; exit 1; fi
+          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ',')
+          if [ -z "$SUBNET_IDS" ]; then SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ','); fi
+          if [ -z "$SUBNET_IDS" ]; then echo "No subnets found in $VPC_ID."; exit 1; fi
+          # ECS needs its service-linked role; create it if the account doesn't have one yet (idempotent).
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com >/dev/null 2>&1 || true
+          aws cloudformation deploy --template-file infra/website.yaml --stack-name tudovu-wiki-demodeployments-com-app --capabilities CAPABILITY_IAM --tags "tudovu:repo=$REPO_FULL" --parameter-overrides ImageUri="$IMAGE" VpcId="$VPC_ID" PublicSubnetIds="$SUBNET_IDS" HostedZoneId="$ZONE_ID"
+      # CREATE_COMPLETE means the infrastructure exists, not that the application works. A load
+      # balancer health check is satisfied by any response under 400, so an app that returns 500 on
+      # every page -- a database it cannot reach, a missing migration, a bad setting -- still
+      # deploys "successfully". DVWA did exactly that: green stack, healthy target, and every page
+      # a fatal error.
+      #
+      # So the deployment asks the one question the health check does not: does this actually
+      # serve? Retried, because a container that has only just registered is not yet a failure.
+      - name: Verify the deployment serves
+        run: |
+          URL="https://wiki.demodeployments.com/"
+          for attempt in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$URL" || echo 000)
+            case "$CODE" in
+              000) echo "attempt $attempt: no response yet" ;;
+              5*)  echo "attempt $attempt: HTTP $CODE — serving, but failing" ;;
+              *)   echo "$URL returned HTTP $CODE"; exit 0 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::$URL never returned a non-5xx response. The stack deployed and the target is"
+          echo "::error::healthy, so this is the application failing, not the infrastructure — check the"
+          echo "::error::container logs in CloudWatch for the cluster this stack created."
+          exit 1
