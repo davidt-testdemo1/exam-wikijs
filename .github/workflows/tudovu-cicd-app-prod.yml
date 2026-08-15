@@ -197,6 +197,29 @@ jobs:
         uses: zaproxy/action-baseline@v0.12.0
         with:
           target: ${{ vars.STAGING_URL || 'https://wiki.demodeployments.com' }}
+          # The action files its report as a GitHub ISSUE by default, which needs issues: write.
+          # This workflow does not have it, so the step failed with "Resource not accessible by
+          # integration" -- a permissions error, on every run where the scan actually happened, no
+          # matter what it found. The scan had run and passed; the gate failed anyway.
+          #
+          # Turned off rather than granting the permission: the report is already uploaded as an
+          # artifact below, and a security pipeline should not hold write access to the issue
+          # tracker to publish something it can attach to its own run.
+          allow_issue_writing: false
+          # Findings are reported, not fatal. The baseline scan warns on things like a missing
+          # header on a page that may not be the deployed app at all, and a gate that blocks on
+          # those teaches people to bypass it.
+          fail_action: false
+      - name: Publish the DAST report
+        if: always() && steps.dast_target.outputs.resolves == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-report
+          path: |
+            report_html.html
+            report_md.md
+            report_json.json
+          if-no-files-found: ignore
       - name: DAST skipped (no target)
         if: false
         run: echo "Set the STAGING_URL repo variable to run the OWASP ZAP (DAST) gate against your staging URL."
