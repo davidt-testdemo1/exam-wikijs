@@ -194,7 +194,11 @@ jobs:
           fi
       - name: OWASP ZAP baseline (DAST)
         if: steps.dast_target.outputs.resolves == 'true'
-        uses: zaproxy/action-baseline@v0.12.0
+        # v0.12.0 uploaded its report through the Actions artifact v3 API, which has since been
+        # retired: the step died with "The artifact name zap_scan is not valid" AFTER a clean scan
+        # (FAIL-NEW: 0, PASS: 62). A pinned third-party action is not frozen in behaviour -- the
+        # services it calls move underneath it -- so pinning buys reproducibility, not immunity.
+        uses: zaproxy/action-baseline@v0.15.0
         with:
           target: ${{ vars.STAGING_URL || 'https://wiki.demodeployments.com' }}
           # The action files its report as a GitHub ISSUE by default, which needs issues: write.
