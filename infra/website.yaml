@@ -230,6 +230,21 @@ Resources:
       LaunchType: FARGATE
       DesiredCount: !Ref DesiredCount
       TaskDefinition: !Ref TaskDefinition
+      # An app that cannot start must fail the deployment, not hang it.
+      #
+      # Without this, ECS retries a crash-looping task forever and CloudFormation sits in
+      # CREATE_IN_PROGRESS for hours waiting for a service that will never stabilise -- and the
+      # stack cannot be updated while it waits, so the fix cannot be deployed either. Every attempt
+      # then costs a manual delete plus a full RDS teardown. Measured repeatedly here: a container
+      # that could not reach its database held the stack for the better part of an hour with
+      # nothing in the console saying why.
+      #
+      # The circuit breaker stops after a few failed placements and rolls back, so the failure
+      # arrives in minutes with the task's own stopped reason attached.
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
