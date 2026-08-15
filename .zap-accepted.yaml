@@ -1,0 +1,13 @@
+# Accepted DAST findings, honoured by the Tudovu secure pipeline.
+#
+# Each entry suppresses ONE ZAP rule until its expiry date, after which the finding blocks again.
+# That is the point: an acceptance without an expiry is indistinguishable from switching the check
+# off, and the situation a risk was accepted against changes.
+#
+# Managed by Tudovu — edit here or through the app; the file is the source of truth.
+findings:
+  - pluginId: "10038"
+    reason: "Wiki.js loads its own bundled scripts and styles; a policy has to be written against the app's real origins before it can be enforced. Tracked for the next maintenance window."
+    acceptedBy: "david@example.com"
+    acceptedAt: "2026-08-15"
+    expiresAt: "2026-09-14"
