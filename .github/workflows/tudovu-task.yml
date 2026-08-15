@@ -1,0 +1,107 @@
+# .github/workflows/tudovu-task.yml — Tudovu runs ONE named task in this repository.
+#
+# Tudovu can write files without this. What it cannot do is re-resolve a lockfile, apply a
+# migration, or prove a fix builds — all of which need the toolchain that is already right here.
+#
+# Every task is a NAME chosen from the list below, never a command Tudovu composes. The arguments
+# are executed without a shell, the job holds write access to this repository and nothing else,
+# and it commits only the files the task declared it would change.
+#
+# Delete this file to withdraw the capability. Nothing else in the pipeline depends on it.
+name: Tudovu Task Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: The task to run
+        required: true
+        type: choice
+        options:
+          - lockfile:refresh
+          - migrations:run
+          - build:verify
+      argv_json:
+        description: JSON array of arguments (no shell is involved)
+        required: true
+        type: string
+      writes_json:
+        description: JSON array of files this task may change
+        required: true
+        type: string
+      note:
+        description: Why Tudovu asked for this, recorded in the commit
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run-task:
+    name: ${{ inputs.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchains a task might need. Each is a no-op when the project does not use it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pipx install uv || pip install --user uv
+      - name: Install poetry
+        run: pipx install poetry || pip install --user poetry
+
+      - name: Run the task
+        id: run
+        env:
+          TUDOVU_TASK: ${{ inputs.task }}
+          TUDOVU_ARGV: ${{ inputs.argv_json }}
+        # execFileSync with an argv array — no shell, so an argument cannot become a command.
+        run: |
+          node -e '
+            const { execFileSync } = require("node:child_process");
+            const argv = JSON.parse(process.env.TUDOVU_ARGV || "[]");
+            if (!Array.isArray(argv) || argv.length === 0 || argv.some((a) => typeof a !== "string")) {
+              console.error("argv must be a non-empty array of strings");
+              process.exit(2);
+            }
+            console.log("running:", JSON.stringify(argv));
+            execFileSync(argv[0], argv.slice(1), { stdio: "inherit" });
+          '
+
+      - name: Commit only the declared files
+        if: success()
+        env:
+          TUDOVU_WRITES: ${{ inputs.writes_json }}
+          TUDOVU_NOTE: ${{ inputs.note }}
+          TUDOVU_TASK: ${{ inputs.task }}
+        # A task that touched anything it did not declare is a bug — refuse rather than commit it.
+        run: |
+          set -euo pipefail
+          WRITES=$(node -e 'const w=JSON.parse(process.env.TUDOVU_WRITES||"[]"); if(!Array.isArray(w)) process.exit(2); console.log(w.join("\n"))')
+          if [ -z "$WRITES" ]; then
+            echo "Task declared no file changes; nothing to commit."
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only)
+          if [ -z "$CHANGED" ]; then
+            echo "Task made no changes."
+            exit 0
+          fi
+          echo "changed:"; echo "$CHANGED"
+          UNDECLARED=$(comm -23 <(echo "$CHANGED" | sort -u) <(echo "$WRITES" | sort -u))
+          if [ -n "$UNDECLARED" ]; then
+            echo "::error::The task changed files it did not declare:"; echo "$UNDECLARED"
+            exit 1
+          fi
+          git config user.name "tudovu[bot]"
+          git config user.email "tudovu[bot]@users.noreply.github.com"
+          echo "$WRITES" | xargs git add --
+          git commit -m "chore(tudovu): ${TUDOVU_TASK}" -m "${TUDOVU_NOTE:-Run by Tudovu.}"
+          git push
