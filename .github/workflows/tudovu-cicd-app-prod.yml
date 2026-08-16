@@ -40,7 +40,6 @@ jobs:
           else
             echo "No infra templates to lint."
           fi
-      # Dockerfile is added by this pull request.
       - name: Build application image
         env:
           GIT_SHA: ${{ github.sha }}
@@ -86,10 +85,116 @@ jobs:
         if: steps.codeql_langs.outputs.languages != ''
         continue-on-error: true
         uses: github/codeql-action/analyze@v3
+      # The scan writes a report; the step below decides what it means. Separated for the same
+      # reason DAST is: a scanner that fails to run must never be indistinguishable from an
+      # application that failed a check.
       - name: Semgrep policy scan (SAST)
         run: |
           python -m pip install --quiet 'semgrep==1.145.0'
-          semgrep scan --config=p/security-audit --config=p/secrets --severity=ERROR --error --quiet
+          semgrep scan --config=p/security-audit --config=p/secrets --severity=ERROR --json --output semgrep-results.json --quiet || true
+          test -f semgrep-results.json || { echo "::error::Semgrep produced no report, so its result is unknown. Not treating that as a pass."; exit 1; }
+      - name: Publish the SAST report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-results.json
+          if-no-files-found: ignore
+      - name: Evaluate SAST findings
+        run: |
+          python -m pip install --quiet "PyYAML==6.0.2"
+          python - <<'TUDOVU_SAST_GATE'
+          import json, os, sys, datetime
+          try:
+              import yaml
+          except ImportError:
+              print("::error::PyYAML is missing, so accepted findings cannot be read. Failing rather than ignoring the file.")
+              sys.exit(1)
+
+          REPORT = "semgrep-results.json"
+          ACCEPTED = ".semgrep-accepted.yaml"
+          ORDER = ["INFO", "WARNING", "ERROR"]
+          FLOOR = "ERROR"
+
+          # A missing report is not a clean scan.
+          if not os.path.exists(REPORT):
+              print("::error::" + REPORT + " is missing, so the scan's result is unknown. Not treating that as a pass.")
+              sys.exit(1)
+
+          with open(REPORT) as fh:
+              raw = json.load(fh)
+
+          findings = []
+          for r in raw.get("results") or []:
+              rule = str(r.get("check_id", "")).strip()
+              if not rule:
+                  continue
+              extra = r.get("extra") or {}
+              sev = str(extra.get("severity", "WARNING")).upper()
+              findings.append({
+                  "rule": rule,
+                  "path": str(r.get("path", "")).lstrip("./"),
+                  "line": (r.get("start") or {}).get("line", 0),
+                  "sev": sev if sev in ORDER else "WARNING",
+                  "fp": extra.get("fingerprint"),
+                  "msg": (extra.get("message") or "").strip(),
+              })
+
+          accepted, expired = [], []
+          today = datetime.date.today().isoformat()
+          if os.path.exists(ACCEPTED):
+              doc = yaml.safe_load(open(ACCEPTED)) or {}
+              for e in (doc.get("findings") or []):
+                  rule, path = str(e.get("ruleId", "")).strip(), str(e.get("path", "")).strip()
+                  exp = str(e.get("expiresAt", ""))
+                  if not rule or not path:
+                      # A path-less entry would accept the rule everywhere. Refused rather than honoured.
+                      print("::warning::Ignoring an acceptance without both a ruleId and a path: " + str(e))
+                      continue
+                  (accepted if exp and exp >= today else expired).append(
+                      {"rule": rule, "path": path, "fp": e.get("fingerprint"), "exp": exp, "reason": e.get("reason", "")}
+                  )
+
+          for e in expired:
+              print("::warning::Acceptance for " + e["rule"] + " in " + e["path"] + " expired on " + str(e["exp"]) + ". It blocks again from now on.")
+
+          def covered(f):
+              for a in accepted:
+                  if a["rule"] != f["rule"] or a["path"] != f["path"]:
+                      continue
+                  if a.get("fp"):
+                      if a["fp"] == f.get("fp"):
+                          return True
+                      continue
+                  return True
+              return False
+
+          blocking = [f for f in findings if ORDER.index(f["sev"]) >= ORDER.index(FLOOR) and not covered(f)]
+          accepted_hits = [f for f in findings if covered(f)]
+
+          print("SAST: " + str(len(findings)) + " finding(s), " + str(len(accepted_hits)) + " accepted, " + str(len(blocking)) + " blocking (threshold: " + FLOOR + " and above).")
+          for f in sorted(findings, key=lambda x: (x["path"], x["line"])):
+              state = "BLOCKING" if f in blocking else ("accepted" if covered(f) else "below threshold")
+              print("  [" + f["sev"] + "] " + f["path"] + ":" + str(f["line"]) + " " + f["rule"] + " - " + state)
+
+          # An acceptance matching nothing is a standing permission for code that is gone. Left alone it
+          # eventually covers something new that lands in the same file.
+          for a in accepted:
+              if not any(a["rule"] == f["rule"] and a["path"] == f["path"] for f in findings):
+                  print("::warning::The acceptance for " + a["rule"] + " in " + a["path"] + " no longer matches anything. Remove it.")
+
+          if not blocking:
+              sys.exit(0)
+
+          print("::error::" + str(len(blocking)) + " SAST finding(s) are neither fixed nor accepted.")
+          for f in blocking:
+              print("::error::" + f["path"] + ":" + str(f["line"]) + " " + f["rule"] + " - " + f["msg"][:160])
+          print("::error::Fix them, or record an expiring acceptance naming the rule AND the file. Accepting a")
+          print("::error::rule without a file would also accept the next match, in code nobody has written yet.")
+          sys.exit(1)
+
+          TUDOVU_SAST_GATE
+
       - name: Unit tests
         run: |
           if [ -f package.json ]; then
@@ -145,7 +250,7 @@ jobs:
       - name: Trivy base image scan (advisory, does not block)
         # Base image + OS packages + vendored packaging tooling. Not reachable from
         # any dependency manifest, so blocking on these would leave a diligent repo
-        # permanently red. Tudovu selected this base image, so these are ours to fix.
+        # permanently red. from your own Dockerfile.
         #
         # continue-on-error, not just exit-code: 0. Those are different things — exit-code
         # governs FINDINGS, while trivy itself exits non-zero when it cannot inspect the image
@@ -169,7 +274,7 @@ jobs:
           name: trivy-results
           path: trivy-results.json
           if-no-files-found: ignore
-      # DAST runs against the deployed site. Default target: https://wiki.demodeployments.com (your chosen domain).
+      # DAST runs against the deployed site. Set the STAGING_URL repo variable to enable it.
       # The STAGING_URL repo variable always overrides.
       #
       # A site that does not exist yet is not a security finding. On the FIRST deployment of a
@@ -182,9 +287,9 @@ jobs:
       # resolves and then misbehaves is still a real failure and still fails the build.
       - name: Check whether the DAST target exists yet
         id: dast_target
-        if: true
+        if: vars.STAGING_URL != ''
         run: |
-          URL="${{ vars.STAGING_URL || 'https://wiki.demodeployments.com' }}"
+          URL="${{ vars.STAGING_URL }}"
           HOST=$(printf '%s' "$URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/?].*$##')
           if getent hosts "$HOST" >/dev/null 2>&1 || host "$HOST" >/dev/null 2>&1; then
             echo "resolves=true" >> "$GITHUB_OUTPUT"
@@ -193,14 +298,14 @@ jobs:
             echo "::notice::$HOST does not resolve yet, so there is nothing to scan. This is expected on a first deployment; DAST runs on the next push, once the site exists."
           fi
       - name: OWASP ZAP baseline (DAST)
-        if: steps.dast_target.outputs.resolves == 'true'
+        if: vars.STAGING_URL != '' && steps.dast_target.outputs.resolves == 'true'
         # v0.12.0 uploaded its report through the Actions artifact v3 API, which has since been
         # retired: the step died with "The artifact name zap_scan is not valid" AFTER a clean scan
         # (FAIL-NEW: 0, PASS: 62). A pinned third-party action is not frozen in behaviour -- the
         # services it calls move underneath it -- so pinning buys reproducibility, not immunity.
         uses: zaproxy/action-baseline@v0.15.0
         with:
-          target: ${{ vars.STAGING_URL || 'https://wiki.demodeployments.com' }}
+          target: ${{ vars.STAGING_URL }}
           # The action files its report as a GitHub ISSUE by default, which needs issues: write.
           # This workflow does not have it, so the step failed with "Resource not accessible by
           # integration" -- a permissions error, on every run where the scan actually happened, no
@@ -215,7 +320,7 @@ jobs:
           # those teaches people to bypass it.
           fail_action: false
       - name: Publish the DAST report
-        if: always() && steps.dast_target.outputs.resolves == 'true'
+        if: always() && vars.STAGING_URL != '' && steps.dast_target.outputs.resolves == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: zap-baseline-report
@@ -228,7 +333,7 @@ jobs:
       # that a scanner failing to publish can never be confused with an application failing a check
       # -- which is exactly what happened when the action could not write its issue.
       - name: Evaluate DAST findings
-        if: steps.dast_target.outputs.resolves == 'true'
+        if: vars.STAGING_URL != '' && steps.dast_target.outputs.resolves == 'true'
         run: |
           python -m pip install --quiet "PyYAML==6.0.2"
           python - <<'TUDOVU_DAST_GATE'
@@ -309,7 +414,7 @@ jobs:
 
           TUDOVU_DAST_GATE
       - name: DAST skipped (no target)
-        if: false
+        if: vars.STAGING_URL == ''
         run: echo "Set the STAGING_URL repo variable to run the OWASP ZAP (DAST) gate against your staging URL."
       # Deploy on main, only when a starter stack is present (the website path
       # ships infra/website.yaml + its own deploy workflow instead). Assumes the
