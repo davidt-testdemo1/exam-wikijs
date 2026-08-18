@@ -1,0 +1,216 @@
+# .github/workflows/tudovu-deploy-app-prod.yml — container service deploy (gated on the secure pipeline)
+name: Tudovu Deploy App / Prod
+on:
+  workflow_run:
+    workflows: ["Tudovu CI/CD App / Prod"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Redeploy as a separate SDLC phase (dev/test/prod) in its own stack. Leave blank for the primary stack."
+        required: false
+        type: string
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    # Auto: only after the secure pipeline passes. Manual: always (workflow_dispatch).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TUDOVU_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.TUDOVU_AWS_REGION || 'us-east-1' }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push image
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Per-app ECR repo named after the repository (lowercased for ECR).
+          REPO=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          aws ecr describe-repositories --repository-names "$REPO" --region us-east-1 >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO" --region us-east-1 --image-scanning-configuration scanOnPush=true --tags "Key=tudovu:repo,Value=$REPO_FULL" >/dev/null
+          IMAGE="$ECR_REGISTRY/$REPO:$GIT_SHA"
+          docker build --label "org.opencontainers.image.source=https://github.com/$REPO_FULL" -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      # Does anything actually scan what we just pushed? See lib/ecr-scan-coverage.ts —
+      # "Inspector is enabled" and "your images are scanned" are different claims, and an
+      # unscanned image looks exactly like a clean one.
+      - name: Check the image will be scanned
+        continue-on-error: true
+        run: |
+          CFG=$(aws ecr get-registry-scanning-configuration --region us-east-1 2>/dev/null) || {
+            echo "::notice::Could not read the registry scanning configuration (needs ecr:GetRegistryScanningConfiguration)."
+            echo "Skipping the coverage check — this does not affect the deployment."
+            exit 0
+          }
+          TYPE=$(printf '%s' "$CFG" | python3 -c "import json,sys;print(json.load(sys.stdin)['scanningConfiguration'].get('scanType',''))")
+          # A repository is covered when some rule's filter matches its name. WILDCARD filters are
+          # substring-with-* — "tudovu-lab-*" matches tudovu-lab-api and "*" matches everything.
+          COVERED=$(printf '%s' "$CFG" | REPO="$REPO" python3 -c "
+          import json, os, sys, fnmatch
+          cfg = json.load(sys.stdin)['scanningConfiguration']
+          repo = os.environ['REPO']
+          for rule in cfg.get('rules', []):
+              for f in rule.get('repositoryFilters', []):
+                  pat = f.get('filter', '')
+                  if fnmatch.fnmatch(repo, pat if '*' in pat else pat + '*'):
+                      print(rule.get('scanFrequency', 'UNKNOWN')); sys.exit(0)
+          print('NONE')
+          ")
+          if [ "$COVERED" = "NONE" ]; then
+            echo "::warning::No registry scanning rule matches \"$REPO\", so this image will not be scanned."
+            echo "Enhanced scanning is $TYPE, but coverage is decided by the registry's rules and none of"
+            echo "them match this repository — it will sit at SCAN_FREQUENCY_MANUAL and report nothing."
+            echo "An unscanned image is indistinguishable from a clean one, which is the reason this"
+            echo "check exists. Add a rule covering it:"
+            echo "  aws ecr put-registry-scanning-configuration --scan-type ENHANCED \\"
+            echo "    --rules '[{\"scanFrequency\":\"CONTINUOUS_SCAN\",\"repositoryFilters\":[{\"filter\":\"*\",\"filterType\":\"WILDCARD\"}]}]'"
+          else
+            echo "$REPO is covered by a $COVERED rule ($TYPE scanning)."
+          fi
+      - name: Resolve VPC + deploy
+        env:
+          STAGE_INPUT: ${{ github.event.inputs.stage }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_FULL: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text --region us-east-1)
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then echo "No default VPC in us-east-1 — create one, or set VpcId/PublicSubnetIds."; exit 1; fi
+          SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ',')
+          if [ -z "$SUBNET_IDS" ]; then SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ','); fi
+          # ECS and RDS need service-linked roles before CloudFormation creates the
+          # service/database. Create them if the account doesn't have them yet (idempotent).
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com >/dev/null 2>&1 || true
+          aws iam create-service-linked-role --aws-service-name rds.amazonaws.com >/dev/null 2>&1 || true
+          # Phase-scoped stack: a dispatched stage deploys an isolated <repo>-<stage>-app
+          # stack (Save Game); the auto path leaves the primary <repo>-app stack untouched.
+          # $STAGE_INPUT / $REPO_NAME come from the step's env: block, never from a
+          # GitHub Actions expression — see DEPLOY_STEP_ENV_YAML.
+          STAGE=$(printf '%s' "${STAGE_INPUT:-}" | tr -cd 'a-z0-9._-' | cut -c1-32)
+          SUFFIX=""
+          [ -n "$STAGE" ] && SUFFIX="-$STAGE"
+          APP_STACK="tudovu-wiki-docs${SUFFIX}-app"
+          EFFECTIVE_STAGE="${STAGE:-demo}"
+          STAGE_TAG=""
+          [ -n "$EFFECTIVE_STAGE" ] && STAGE_TAG="tudovu:stage=$EFFECTIVE_STAGE"
+          echo "APP_STACK=$APP_STACK" >> "$GITHUB_ENV"
+          aws cloudformation deploy --template-file infra/app.yaml --stack-name "$APP_STACK" --capabilities CAPABILITY_IAM --region us-east-1 --tags "tudovu:repo=$REPO_FULL" tudovu:environment="Wiki Docs" tudovu:deployment-kind=customer $STAGE_TAG --parameter-overrides ImageUri="$IMAGE" VpcId="$VPC_ID" PublicSubnetIds="$SUBNET_IDS"
+      - name: Why the deploy failed
+        if: failure()
+        run: |
+          echo "The stack did not deploy. CloudFormation's own reasons follow."
+          aws cloudformation describe-stack-events --stack-name "$APP_STACK" --region us-east-1 \
+            --query "reverse(StackEvents[?ResourceStatusReason!=null && ends_with(ResourceStatus, 'FAILED')].[ResourceStatus,LogicalResourceId,ResourceStatusReason])" \
+            --output text 2>/dev/null | head -25 || true
+          echo "--- current stack status ---"
+          aws cloudformation describe-stacks --stack-name "$APP_STACK" --region us-east-1 \
+            --query "Stacks[0].[StackStatus,StackStatusReason]" --output text 2>/dev/null || true
+          # The single most important failure class produces NO failed stack events at all: a
+          # service that cannot place a task leaves CloudFormation sitting in CREATE_IN_PROGRESS
+          # while ECS retries, for up to three hours. Everything above prints nothing in that
+          # case. The reason is in the ECS service's own event stream and in the stopped tasks —
+          # measured live: a task that could not pull its image sat for 20 minutes with the
+          # stack "in progress" and no signal anywhere else.
+          echo "--- ECS service events (why tasks are not running) ---"
+          CLUSTER=$(aws ecs list-clusters --region us-east-1 --query "clusterArns[?contains(@, '$APP_STACK')]|[0]" --output text 2>/dev/null)
+          if [ -n "$CLUSTER" ] && [ "$CLUSTER" != "None" ]; then
+            SVC=$(aws ecs list-services --cluster "$CLUSTER" --region us-east-1 --query "serviceArns[0]" --output text 2>/dev/null)
+            aws ecs describe-services --cluster "$CLUSTER" --services "$SVC" --region us-east-1 \
+              --query "services[0].events[:8].message" --output text 2>/dev/null || true
+            echo "--- why the last tasks stopped ---"
+            for t in $(aws ecs list-tasks --cluster "$CLUSTER" --desired-status STOPPED --region us-east-1 --query "taskArns[:3]" --output text 2>/dev/null); do
+              aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$t" --region us-east-1 \
+                --query "tasks[0].[stoppedReason,containers[0].reason]" --output text 2>/dev/null || true
+            done
+          fi
+
+      # ── Did the deployment actually work? ──
+      #
+      # CREATE_COMPLETE means CloudFormation built what the template said. It does not mean the
+      # application runs, and the gap between those two is where this product's expensive failures
+      # live: a target group pointed at a port nothing listens on, or a database provisioned,
+      # billing, and never connected to because the app reads a variable it was not given.
+      #
+      # So the deploy asserts two things it can actually observe.
+      - name: Verify the deployment
+        env:
+          APP_STACK: ${{ env.APP_STACK }}
+        run: |
+          set -euo pipefail
+          STACK="${APP_STACK:-}"
+          [ -z "$STACK" ] && { echo "no stack name resolved; skipping verification"; exit 0; }
+          URL=$(aws cloudformation describe-stacks --stack-name "$STACK" --region us-east-1             --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text 2>/dev/null || true)
+
+          # 1. The app answers HTTP. Any status is fine — a 401 or 404 still proves a server is
+          #    listening on the port the load balancer targets, which is the thing being tested.
+          if [ -n "$URL" ] && [ "$URL" != "None" ]; then
+            code=000
+            for _ in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$URL/" || echo 000)
+              [ "$code" != "000" ] && break
+              sleep 10
+            done
+            if [ "$code" = "000" ]; then
+              echo "::error::$URL never answered. The container is not listening on the port the target group probes."
+              exit 1
+            fi
+            echo "app answered HTTP $code at $URL"
+          fi
+
+          # 2. If a database was provisioned, something has to have connected to it.
+          #    Without this the commonest silent failure — the app falling back to localhost or an
+          #    in-memory database while RDS runs untouched — reports success forever.
+          #
+          #    A successful migration is PROOF, and better proof than the metric below: the
+          #    migration task ran the application's own image, with the application's own
+          #    environment, from inside the VPC. If it applied a schema, the credentials, the
+          #    variable names and the network path are all confirmed working.
+          DB=$(aws cloudformation describe-stack-resources --stack-name "$STACK" --region us-east-1             --logical-resource-id Database --query "StackResources[0].PhysicalResourceId" --output text 2>/dev/null || true)
+          if [ -n "$DB" ] && [ "$DB" != "None" ]; then
+            echo "waiting for the app to connect to $DB"
+            connected=0
+            for _ in $(seq 1 20); do
+              MAXC=$(aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name DatabaseConnections                 --dimensions Name=DBInstanceIdentifier,Value="$DB" --region us-east-1                 --start-time "$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-10M +%Y-%m-%dT%H:%M:%SZ)"                 --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --period 60 --statistics Maximum                 --query "sort_by(Datapoints,&Timestamp)[-1].Maximum" --output text 2>/dev/null || echo 0)
+              case "$MAXC" in ''|None|0|0.0) ;; *) connected=1; break;; esac
+              sleep 30
+            done
+            if [ "$connected" = "0" ] && [ "${TUDOVU_MIGRATIONS_APPLIED:-0}" = "1" ]; then
+              echo "DatabaseConnections never showed a connection, but migrations applied against"
+              echo "this instance, which is stronger evidence than the metric. Treating it as connected."
+              connected=1
+            fi
+            if [ "$connected" = "0" ]; then
+              # NOT a failure. DatabaseConnections is a gauge RDS samples once a minute, so a
+              # connection that is opened, used and closed inside one request is almost never
+              # observed. Django closes its connection after every request by default, and so do
+              # most frameworks without a persistent pool — measured here on a Django deployment
+              # that was demonstrably connected and read 0.0 for the entire window.
+              #
+              # Failing on that is worse than not checking: the instruction it produces is to set a
+              # skip variable, and a check everyone disables protects nobody. An unobserved
+              # connection is not an absent one.
+              echo "::warning::No connection to $DB was observed while checking."
+              echo "This is inconclusive rather than bad: DatabaseConnections is sampled once a"
+              echo "minute, so an app that opens a connection per request and closes it — Django,"
+              echo "Rails and classic PHP all do by default — can be fully connected and never"
+              echo "appear here. If your app genuinely cannot reach the database it will normally"
+              echo "fail the check above this one instead."
+              echo "Worth a look if you did not expect it: compare the variable names in the pull"
+              echo "request body against the ones your app actually reads."
+            else
+              echo "database connection observed"
+            fi
+          fi
